@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Hangfire.AspNetCore" Version="1.8.20" />
+        <PackageReference Include="Hangfire.Core" Version="1.8.20" />
+        <PackageReference Include="Hangfire.InMemory" Version="1.0.0" />
+        <PackageReference Include="Hangfire.SqlServer" Version="1.8.20" />
+        <PackageReference Include="MediatR" Version="13.0.0" />
+        <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="9.0.8" />
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="9.0.8" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.8" />
+        <PackageReference Include="FastEndpoints" Version="5.30.0" />
+        <PackageReference Include="FastEndpoints.Swagger" Version="5.30.0" />
+        <PackageReference Include="FluentValidation" Version="11.11.0" />
+
+        <!-- Service Discovery -->
+        <PackageReference Include="Consul" Version="1.7.14.9" />
+    </ItemGroup>
+    <ItemGroup>
+        <ProjectReference Include="..\Application\Dastardly.Application.csproj" />
+        <ProjectReference Include="..\Domain\Dastardly.Domain.csproj" />
+    </ItemGroup>
+
+</Project>
