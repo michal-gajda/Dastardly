@@ -1,0 +1,333 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+env:
+  DOTNET_VERSION: '9.0.x'
+  SOLUTION_FILE: 'Dastardly.slnx'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/order-api
+
+jobs:
+  # Build and Test Job
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+        include-prerelease: true
+    
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+    
+    - name: Restore dependencies
+      run: dotnet restore ${{ env.SOLUTION_FILE }}
+    
+    - name: Build solution
+      run: dotnet build ${{ env.SOLUTION_FILE }} --configuration Release --no-restore
+    
+    - name: Run unit tests
+      run: dotnet test ${{ env.SOLUTION_FILE }} --configuration Release --no-build --verbosity normal --collect:"XPlat Code Coverage" --results-directory ./coverage
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v4
+      if: github.event_name == 'push'
+      with:
+        directory: ./coverage
+        fail_ci_if_error: false
+        verbose: true
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          src/WebApi/bin/Release/net9.0/
+          src/WebApi/Dockerfile
+        retention-days: 30
+
+  # Security Scanning
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+        include-prerelease: true
+    
+    - name: Install security scan tools
+      run: |
+        dotnet tool install --global security-scan
+        dotnet tool install --global dotnet-outdated-tool
+    
+    - name: Run security scan
+      run: security-scan ${{ env.SOLUTION_FILE }} --export sarif --output security-results.sarif
+      continue-on-error: true
+    
+    - name: Check for outdated packages
+      run: dotnet outdated ${{ env.SOLUTION_FILE }}
+      continue-on-error: true
+    
+    - name: Upload SARIF results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: security-results.sarif
+
+  # Code Quality Analysis
+  code-quality:
+    name: Code Quality Analysis
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+        include-prerelease: true
+    
+    - name: Cache SonarCloud packages
+      uses: actions/cache@v4
+      with:
+        path: ~/sonar/cache
+        key: ${{ runner.os }}-sonar
+        restore-keys: ${{ runner.os }}-sonar
+    
+    - name: Install SonarCloud scanner
+      run: dotnet tool install --global dotnet-sonarscanner
+    
+    - name: Build and analyze with SonarCloud
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      run: |
+        dotnet sonarscanner begin /k:"michal-gajda_Dastardly" /o:"michal-gajda" /d:sonar.token="${{ secrets.SONAR_TOKEN }}" /d:sonar.host.url="https://sonarcloud.io"
+        dotnet build ${{ env.SOLUTION_FILE }} --configuration Release
+        dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+      continue-on-error: true
+
+  # Docker Build and Push
+  docker-build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [build-and-test, security-scan]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Create Dockerfile
+      run: |
+        cat > Dockerfile << 'EOF'
+        FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS base
+        WORKDIR /app
+        EXPOSE 8080
+        EXPOSE 8081
+        
+        FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+        ARG BUILD_CONFIGURATION=Release
+        WORKDIR /src
+        COPY ["src/WebApi/Dastardly.WebApi.csproj", "src/WebApi/"]
+        COPY ["src/Infrastructure/Dastardly.Infrastructure.csproj", "src/Infrastructure/"]
+        COPY ["src/Application/Dastardly.Application.csproj", "src/Application/"]
+        COPY ["src/Domain/Dastardly.Domain.csproj", "src/Domain/"]
+        RUN dotnet restore "src/WebApi/Dastardly.WebApi.csproj"
+        COPY . .
+        WORKDIR "/src/src/WebApi"
+        RUN dotnet build "Dastardly.WebApi.csproj" -c $BUILD_CONFIGURATION -o /app/build
+        
+        FROM build AS publish
+        ARG BUILD_CONFIGURATION=Release
+        RUN dotnet publish "Dastardly.WebApi.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+        
+        FROM base AS final
+        WORKDIR /app
+        COPY --from=publish /app/publish .
+        
+        # Create non-root user
+        RUN adduser --disabled-password --gecos '' appuser && chown -R appuser /app
+        USER appuser
+        
+        HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+          CMD curl -f http://localhost:8080/health || exit 1
+        
+        ENTRYPOINT ["dotnet", "Dastardly.WebApi.dll"]
+        EOF
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+
+  # Deploy to Development Environment
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: development
+      url: https://dastardly-dev.yourdomain.com
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Deploy to Development
+      run: |
+        echo "Deploying to development environment..."
+        echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:develop"
+        # Add your deployment commands here
+        # Example: kubectl, helm, docker-compose, etc.
+
+  # Deploy to Production Environment
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://dastardly.yourdomain.com
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Deploy to Production
+      run: |
+        echo "Deploying to production environment..."
+        echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        # Add your deployment commands here
+        # Example: kubectl, helm, docker-compose, etc.
+
+  # Performance Testing
+  performance-test:
+    name: Performance Testing
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js for Artillery
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install Artillery
+      run: npm install -g artillery
+    
+    - name: Run performance tests
+      run: |
+        echo "Running performance tests..."
+        # artillery run performance-tests.yml
+        # Add your performance testing commands here
+      continue-on-error: true
+
+  # Release Creation
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [deploy-prod]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Generate release notes
+      id: release_notes
+      run: |
+        # Generate release notes from commits
+        echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
+        git log --pretty=format:"- %s (%h)" $(git describe --tags --abbrev=0)..HEAD >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ github.run_number }}
+        release_name: Release v${{ github.run_number }}
+        body: |
+          ## Changes in this Release
+          ${{ steps.release_notes.outputs.RELEASE_NOTES }}
+          
+          ## Docker Image
+          `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest`
+          
+          ## Deployment
+          This release has been automatically deployed to production.
+        draft: false
+        prerelease: false
